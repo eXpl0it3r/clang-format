@@ -1,0 +1,279 @@
+name: Release clang-format binaries
+
+on:
+  push:
+  schedule:
+    # Run every 6 hours to check for new LLVM tags
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      llvm_tag:
+        description: 'Specific LLVM tag to process (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_tags: ${{ steps.llvm-tags.outputs.has_new_tags }}
+      tags: ${{ steps.llvm-tags.outputs.tags }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Get LLVM tags
+      id: llvm-tags
+      run: |
+        # Get all LLVM tags starting from llvmorg-14.0.0 (when binary availability became more consistent)
+        # Exclude pre-release candidates (rc versions)
+        git ls-remote --tags https://github.com/llvm/llvm-project.git | \
+        grep 'refs/tags/llvmorg-[0-9]' | \
+        grep -v '\^{}' | \
+        sed 's/.*refs\/tags\///' | \
+        grep -E '^llvmorg-(1[4-9]|[2-9][0-9])\..*' | \
+        grep -v -- '-rc[0-9]' | \
+        sort -V > all_llvm_tags.txt
+        
+        # Get existing tags in our repository, filter to llvmorg-14+ and exclude pre-releases
+        git tag | grep -E '^llvmorg-(1[4-9]|[2-9][0-9])\..*' | grep -v -- '-rc[0-9]' | sort -V > existing_tags.txt 2>/dev/null || echo -n > existing_tags.txt
+        
+        # Debug: show what we have
+        echo "All LLVM tags (first 10):"
+        head -10 all_llvm_tags.txt || true
+        echo "Total LLVM tags found: $(wc -l < all_llvm_tags.txt)"
+        echo "Existing tags:"
+        cat existing_tags.txt || true
+        echo "Total existing tags: $(wc -l < existing_tags.txt)"
+        
+        # Verify both files are sorted correctly
+        echo "Checking if files are sorted..."
+        if sort -V all_llvm_tags.txt | cmp -s - all_llvm_tags.txt; then
+          echo "all_llvm_tags.txt is properly sorted"
+        else
+          echo "ERROR: all_llvm_tags.txt is not sorted, re-sorting..."
+          sort -V all_llvm_tags.txt -o all_llvm_tags.txt
+        fi
+        
+        if sort -V existing_tags.txt | cmp -s - existing_tags.txt; then
+          echo "existing_tags.txt is properly sorted"
+        else
+          echo "ERROR: existing_tags.txt is not sorted, re-sorting..."
+          sort -V existing_tags.txt -o existing_tags.txt
+        fi
+        
+        # Find new tags (tags that exist in LLVM but not in our repo)
+        comm -23 all_llvm_tags.txt existing_tags.txt > new_tags.txt
+        
+        # If specific tag is provided via workflow_dispatch, process only that tag
+        if [ -n "${{ github.event.inputs.llvm_tag }}" ]; then
+          echo "${{ github.event.inputs.llvm_tag }}" > new_tags.txt
+        fi
+        
+        echo "New tags found:"
+        cat new_tags.txt
+        
+        # Set output for matrix strategy
+        if [ -s new_tags.txt ]; then
+          # Convert to JSON array for matrix
+          tags_json=$(cat new_tags.txt | jq -R -s -c 'split("\n")[:-1]')
+          echo "tags=${tags_json}" >> $GITHUB_OUTPUT
+          echo "has_new_tags=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_new_tags=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Check for new tags output
+      run: |
+        echo "Has new tags: ${{ steps.llvm-tags.outputs.has_new_tags }}"
+        echo "Tags: ${{ steps.llvm-tags.outputs.tags }}"
+
+  create-releases:
+    needs: check-and-release
+    if: needs.check-and-release.outputs.has_new_tags == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        llvm_tag: ${{ fromJson(needs.check-and-release.outputs.tags) }}
+      max-parallel: 3
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Process LLVM tag ${{ matrix.llvm_tag }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        LLVM_TAG: ${{ matrix.llvm_tag }}
+      run: |
+        set -e
+        
+        echo "Processing LLVM tag: ${LLVM_TAG}"
+        
+        # Extract version number (remove llvmorg- prefix)
+        VERSION=${LLVM_TAG#llvmorg-}
+        echo "Version: ${VERSION}"
+        
+        # Check if this tag already exists in our repo
+        if git tag | grep -q "^${LLVM_TAG}$"; then
+          echo "Tag ${LLVM_TAG} already exists in repository, skipping..."
+          exit 0
+        fi
+        
+        # Create working directory
+        mkdir -p releases/${VERSION}
+        cd releases/${VERSION}
+        
+        # Define download URLs for different platforms
+        BASE_URL="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}"
+        
+        # Platform-specific download URLs and extraction
+        # Some older versions may have different archive naming conventions
+        declare -A PLATFORMS=(
+          ["linux-x64"]="clang+llvm-${VERSION}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+          ["linux-arm64"]="clang+llvm-${VERSION}-aarch64-linux-gnu.tar.xz"
+          ["macos-x64"]="clang+llvm-${VERSION}-x86_64-apple-darwin.tar.xz"
+          ["macos-arm64"]="clang+llvm-${VERSION}-arm64-apple-darwin22.0.tar.xz"
+          ["windows-x64"]="LLVM-${VERSION}-win64.exe"
+          ["windows-x86"]="LLVM-${VERSION}-win32.exe"
+        )
+        
+        # Fallback naming for older versions
+        declare -A FALLBACK_PLATFORMS=(
+          ["linux-x64"]="clang+llvm-${VERSION}-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
+          ["macos-x64"]="clang+llvm-${VERSION}-x86_64-apple-darwin19.tar.xz"
+          ["macos-arm64"]="clang+llvm-${VERSION}-arm64-apple-darwin21.0.tar.xz"
+        )
+        
+        # Download and extract clang-format binaries
+        for platform in "${!PLATFORMS[@]}"; do
+          archive="${PLATFORMS[$platform]}"
+          download_url="${BASE_URL}/${archive}"
+          
+          echo "Downloading ${platform}: ${download_url}"
+          
+          # Try to download the archive
+          downloaded=false
+          if curl -L -f -o "${archive}" "${download_url}"; then
+            echo "Successfully downloaded ${archive}"
+            downloaded=true
+          else
+            echo "Failed to download ${archive}"
+            # Try fallback naming if available
+            if [[ -n "${FALLBACK_PLATFORMS[$platform]}" ]]; then
+              fallback_archive="${FALLBACK_PLATFORMS[$platform]}"
+              fallback_url="${BASE_URL}/${fallback_archive}"
+              echo "Trying fallback for ${platform}: ${fallback_url}"
+              if curl -L -f -o "${fallback_archive}" "${fallback_url}"; then
+                echo "Successfully downloaded fallback ${fallback_archive}"
+                archive="${fallback_archive}"
+                downloaded=true
+              else
+                echo "Fallback also failed for ${platform}"
+              fi
+            fi
+          fi
+          
+          if [ "$downloaded" = true ]; then
+            # Extract clang-format binary based on file type
+            if [[ "${archive}" == *.tar.xz ]]; then
+              # Extract tar.xz files
+              tar -tf "${archive}" | grep -E 'bin/clang-format$' | head -1 > clang_format_path.txt || true
+              if [ -s clang_format_path.txt ]; then
+                clang_format_path=$(cat clang_format_path.txt)
+                tar -xf "${archive}" "${clang_format_path}"
+                cp "${clang_format_path}" "clang-format-${platform}"
+                chmod +x "clang-format-${platform}"
+                echo "Extracted clang-format for ${platform}"
+              fi
+            elif [[ "${archive}" == *.exe ]]; then
+              # Extract Windows installer using 7zip
+              if command -v 7z >/dev/null 2>&1; then
+                7z x "${archive}" -o"windows_extract" -y >/dev/null || true
+                find windows_extract -name "clang-format.exe" | head -1 > clang_format_path.txt || true
+                if [ -s clang_format_path.txt ]; then
+                  clang_format_path=$(cat clang_format_path.txt)
+                  cp "${clang_format_path}" "clang-format-${platform}.exe"
+                  echo "Extracted clang-format.exe for ${platform}"
+                fi
+              else
+                echo "7zip not available, skipping Windows extraction for ${platform}"
+              fi
+            fi
+            
+            # Clean up
+            rm -f "${archive}"
+            rm -rf windows_extract
+            rm -f clang_format_path.txt
+          else
+            echo "Failed to download any archive for ${platform}, skipping"
+          fi
+        done
+        
+        # List extracted binaries
+        ls -la clang-format-* || true
+        
+        # Check if we have any binaries before proceeding
+        if ! ls clang-format-* >/dev/null 2>&1; then
+          echo "No clang-format binaries were successfully extracted for ${LLVM_TAG}"
+          echo "This might be because binaries are not available for this version/platform combination"
+          exit 0
+        fi
+        
+        # Create a tag in our repository
+        cd ../..
+        git tag -a "${LLVM_TAG}" -m "clang-format binaries from LLVM ${VERSION}"
+        git push origin "${LLVM_TAG}"
+        
+        # Create GitHub release with simple description to avoid bash interpretation issues
+        RELEASE_NAME="clang-format ${VERSION}"
+        
+        # Create release notes file
+        echo "Standalone clang-format binaries extracted from LLVM ${VERSION}" > release_notes.txt
+        echo "" >> release_notes.txt
+        echo "Download the appropriate binary for your platform and make it executable (chmod +x on Unix systems)." >> release_notes.txt
+        echo "" >> release_notes.txt
+        echo "Available binaries may include:" >> release_notes.txt
+        echo "- clang-format-linux-x64 (Linux x86_64)" >> release_notes.txt
+        echo "- clang-format-linux-arm64 (Linux ARM64)" >> release_notes.txt
+        echo "- clang-format-macos-x64 (macOS Intel)" >> release_notes.txt
+        echo "- clang-format-macos-arm64 (macOS Apple Silicon)" >> release_notes.txt
+        echo "- clang-format-windows-x64.exe (Windows x64)" >> release_notes.txt
+        echo "- clang-format-windows-x86.exe (Windows x86)" >> release_notes.txt
+        echo "" >> release_notes.txt
+        echo "Note: Not all platforms may be available for every LLVM version." >> release_notes.txt
+        echo "" >> release_notes.txt
+        echo "Source: https://github.com/llvm/llvm-project/releases/tag/${LLVM_TAG}" >> release_notes.txt
+        
+        # Create the release
+        gh release create "${LLVM_TAG}" \
+          --title "${RELEASE_NAME}" \
+          --notes-file release_notes.txt \
+          --target master
+        
+        # Upload binaries if they exist
+        cd releases/${VERSION}
+        for binary in clang-format-*; do
+          if [ -f "${binary}" ]; then
+            echo "Uploading ${binary}..."
+            gh release upload "${LLVM_TAG}" "${binary}"
+          fi
+        done
+        
+        echo "Successfully created release for ${LLVM_TAG}"
